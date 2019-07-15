@@ -10,17 +10,6 @@
 #include <OBD2UART.h>
 #include <MicroLCD.h>
 
-static const PROGMEM uint8_t intake_bits []  = {
-  0x00, 0x00, 0x00, 0x00, 0x6f, 0x80, 0x00, 0x00, 0x6c, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x10, 0x00, 
-  0x0f, 0x00, 0x38, 0x00, 0x0c, 0x00, 0x38, 0x00, 0x0c, 0x00, 0x3f, 0xe0, 0x0c, 0x00, 0x3f, 0xe0, 
-  0x0c, 0xe0, 0x3f, 0xe0, 0x01, 0x10, 0x38, 0x00, 0x00, 0x10, 0x38, 0x00, 0x00, 0x10, 0x3f, 0xe0, 
-  0x7f, 0xf3, 0x3f, 0xe0, 0x7f, 0xe4, 0xbf, 0xe0, 0x00, 0x00, 0xb8, 0x00, 0x1f, 0xff, 0xb8, 0x00, 
-  0x1f, 0xff, 0x3f, 0xe0, 0x00, 0x00, 0x3f, 0xe0, 0x7f, 0xfe, 0x3f, 0xe0, 0x7f, 0xff, 0x38, 0x00, 
-  0x00, 0x01, 0x38, 0x00, 0x00, 0x09, 0x7c, 0x00, 0x00, 0x06, 0x7c, 0x00, 0x00, 0x00, 0x7c, 0x00, 
-  0x00, 0x00, 0x7c, 0x00, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00                                                                 
-};
-
 LCD_SH1106 lcd;
 COBD obd;
 
@@ -38,7 +27,7 @@ void reconnect()
   }
 }
 
-void showData(byte pid, double value)
+void showData(byte pid, int value)
 {
   switch (pid) {
   case PID_RPM:
@@ -46,24 +35,22 @@ void showData(byte pid, double value)
     lcd.setFontSize(FONT_SIZE_XLARGE);
     lcd.printInt((unsigned int)value % 10000, 4);
     break;
-  case PID_SPEED:
+  case PID_BATTERY_VOLTAGE:
     lcd.setCursor(0, 0);
     lcd.setFontSize(FONT_SIZE_XLARGE);
     lcd.printInt((unsigned int)value % 1000, 3);
     break;
-  case PID_THROTTLE:
+  case PID_INTAKE_TEMP:
     lcd.setCursor(88, 5);
     lcd.setFontSize(FONT_SIZE_MEDIUM);
-    lcd.printInt((int)value % 100, 3);
+    lcd.printInt(value % 100, 3);
     lcd.setFontSize(FONT_SIZE_SMALL);
-    lcd.print(" %");
+    lcd.print(" F");
     break;
-  case PID_ENGINE_LOAD:
+  case PID_AIR_FUEL_EQUIV_RATIO:
     lcd.setCursor(12, 5);
     lcd.setFontSize(FONT_SIZE_MEDIUM);
-    lcd.printInt((int)value, 3);
-    lcd.setFontSize(FONT_SIZE_SMALL);
-    lcd.print(" %");
+    lcd.printInt((unsigned int)value % 1000, 2);
     break;
   }
 }
@@ -73,22 +60,18 @@ void initScreen()
   lcd.clear();
   lcd.setFontSize(FONT_SIZE_SMALL);
   lcd.setCursor(24, 3);
-  lcd.print("km/h");
+  lcd.print("VOLTS");
   lcd.setCursor(110, 3);
-  lcd.print("rpm");
-  lcd.setCursor(0, 7);
-  lcd.print("ENGINE LOAD");
-  lcd.setCursor(80, 7);
-  lcd.print("THROTTLE");
+  lcd.print("RPM");
+  lcd.setCursor(10, 7);
+  lcd.print("AFR");
+  lcd.setCursor(70, 7);
+  lcd.print("IN. TEMP");
 }
 
 void setup()
 {
   lcd.begin();
-  
-  lcd.draw(intake_bits, 16, 16);
-  delay(2000);
-  lcd.clear();
   lcd.setFontSize(FONT_SIZE_MEDIUM);
   lcd.println("OBD DISPLAY");
 
@@ -103,12 +86,12 @@ void setup()
 
 void loop()
 {
-  static byte pids[]= {PID_RPM, PID_SPEED, PID_ENGINE_LOAD, PID_THROTTLE};
+  static byte pids[]= {PID_RPM, PID_BATTERY_VOLTAGE, PID_AIR_FUEL_EQUIV_RATIO, PID_INTAKE_TEMP};
   static byte index = 0;
   byte pid = pids[index];
-  double value;
+  int value;
   // send a query to OBD adapter for specified OBD-II pid
-  if (obd.readPID(pid, (int&)value)) {
+  if (obd.readPID(pid, value)) {
       showData(pid, value);
   }
   index = (index + 1) % sizeof(pids);
