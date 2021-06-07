@@ -1,8 +1,10 @@
-#include <Wire.h>
-#include <OBD2UART.h>
-#include <MicroLCD.h>
+/*************************************************************************
+* Bitmaps for OBD Data Display
+* Converted *.bmp files to hex. Copy/pasted into arrays here.
+* Author: Morgan Chumbley <github.com/notchum>
+*************************************************************************/
 
-const unsigned char okay [] PROGMEM = {
+const unsigned char its_okay [] PROGMEM = {
   // 128x21px
   0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0xf8, 0xf8, 0x10, 0x00, 0x00, 0x00, 0x00, 0x30, 0x18, 0x18, 
   0x10, 0xd0, 0xe0, 0x20, 0x60, 0xc0, 0x80, 0x00, 0x00, 0x60, 0x60, 0xe0, 0x00, 0x00, 0x00, 0x80, 
