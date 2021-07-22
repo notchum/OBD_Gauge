@@ -1,20 +1,30 @@
 /*************************************************************************
 * OBD Data Display
-* Works with any Arduino board connected with SH1106 128*64 I2C OLED and
-* Freematics OBD-II UART Adapter - https://freematics.com/products
+* Works with NodeMCU board connected with SSD1306 128*64 SPI OLED and
+* Freematics OBD-II UART Adapter.
 * Author: Morgan Chumbley <github.com/notchum>
 *************************************************************************/
+// #define _DEBUG_
 
 // LIBRARIES
 #include <SPI.h>
 #include <Wire.h>
+#include <TaskScheduler.h>
 #include <Adafruit_SSD1306.h>
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold9pt7b.h>
 #include <OBD2UART.h>
 #include "bitmaps.h"
 
-// SCREEN CONSTS
+#ifdef _DEBUG_
+#define _PP(a) Serial.print(a);
+#define _PL(a) Serial.println(a);
+#else
+#define _PP(a)
+#define _PL(a)
+#endif
+
+// DISPLAY CONSTS
 #define SCREEN_WIDTH  128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64  // OLED display height, in pixels
 #define OLED_MOSI     13
@@ -23,32 +33,30 @@
 #define OLED_CS       15
 #define OLED_RESET    12
 
-// DISPLAY CONSTS
+// FONT CONSTS
 #define FONT_DEF_W  6
 #define FONT_DEF_H  8
 #define FONT_9PT_W  10
 #define FONT_9PT_H  14
 #define FONT_12PT_W 14
-#define FONT_12PT_H 19
+#define FONT_12PT_H 17
 
 // OBD CONSTS
 #define PID_AIR_FUEL_RATIO 0x34
-#define BTN_LOW_VALUE      1000
-#define BTN_HIGH_VALUE     1050
 #define BUFFER_SIZE        130
-#define N_SCREENS          3
 #define N_PIDS             11
+#define N_SCREENS          3
 
 // OTHER CONSTS
-#define FLOAT_TYPE1 0xA
-#define FLOAT_TYPE2 0xB
-#define INT_TYPE    0xC
-#define UINT_TYPE   0xD
-#define DEBUG 1
+#define INT_TYPE   0xA
+#define FLOAT_TYPE 0xB
+#define UINT_TYPE  0xC
 
 // GLOBALS
-int buttonV ;  // Create button
-COBD obd    ;  // Create obd object
+Scheduler runner   ; // Create scheduler object
+COBD obd           ; // Create obd object
+byte pid_inx = 0   ; // PID index
+byte screen_inx = 0; // Current screen
 Adafruit_SSD1306 display( SCREEN_WIDTH  , // Create display
                           SCREEN_HEIGHT ,
                           OLED_MOSI     , 
@@ -56,6 +64,8 @@ Adafruit_SSD1306 display( SCREEN_WIDTH  , // Create display
                           OLED_DC       , 
                           OLED_RESET    , 
                           OLED_CS       );
+const int BUTTON_PIN = 5         ; // Button pin
+volatile bool btnPinHandled = true;
 
 // STRUCTS
 typedef struct
@@ -63,131 +73,120 @@ typedef struct
    byte pid;            // OBD PID
    byte type;           // data type
    byte screen;         // screen index for the data
-   int  value;          // value read from ECU
-   float Fvalue;        // value read (in float)
-   unsigned int Uvalue; // value read (in uint)
-   GFXfont font;        // font for the data
-   int16_t posX;        // x position on screen
-   int16_t posY;        // y position on screen
+   int raw_data;        // value read from ECU
+   int Ivalue;          // processed data (in int)
+   float Fvalue;        // processed data (in float)
+   unsigned int Uvalue; // processed data (in uint)
 } DataType;
 
-// FORWARD DECLARATIONS
-static void reconnect    ( void );
-static void showData     ( byte screen_inx, DataType crt_data );
-static void drawBgScreen ( byte screen_inx );
+DataType data[N_PIDS] = { {PID_AIR_FUEL_RATIO,  FLOAT_TYPE, 0, 0, 0, 0, 0},
+                          {PID_INTAKE_TEMP,     INT_TYPE  , 0, 0, 0, 0, 0},
+                          {PID_ENGINE_OIL_TEMP, INT_TYPE  , 0, 0, 0, 0, 0},
+                          {PID_BATTERY_VOLTAGE, FLOAT_TYPE, 1, 0, 0, 0, 0},
+                          {PID_COOLANT_TEMP,    INT_TYPE  , 1, 0, 0, 0, 0},
+                          {PID_FUEL_PRESSURE,   INT_TYPE  , 1, 0, 0, 0, 0},
+                          {PID_RPM,             UINT_TYPE , 2, 0, 0, 0, 0}, 
+                          {PID_SPEED,           UINT_TYPE , 2, 0, 0, 0, 0},
+                          {PID_ENGINE_LOAD,     INT_TYPE  , 2, 0, 0, 0, 0},
+                          {PID_THROTTLE,        INT_TYPE  , 2, 0, 0, 0, 0},
+                          {PID_MAF_FLOW,        FLOAT_TYPE, 2, 0, 0, 0, 0} };
 
-void setup( void )
+// CALLBACK PROTOTYPES
+void readObdDataCB ( void );
+void drawScreenCB  ( void );
+void btnHandleCB   ( void );
+
+// TASK CREATIONS
+Task tReadDataOBD ( 10 , TASK_FOREVER, &readObdDataCB );
+Task tDrawScreen  ( 60 , TASK_FOREVER, &drawScreenCB  );
+Task tBtnHandle   ( 500, TASK_ONCE   , &btnHandleCB   );
+
+
+/*************************
+ *    FUNCTIONS
+ ************************/
+
+
+void ICACHE_RAM_ATTR buttonPressed( void )
 {
-#ifdef DEBUG
-   Serial.begin(115200);
-   Serial.setDebugOutput(true);
-   Serial.println("\n\n\n=============\nOBD Gauge\n=============");
-#endif
-
-   // Initialize button 
-   pinMode(A0, INPUT_PULLUP);
-
-   // Start screen
-   if(!display.begin(SSD1306_SWITCHCAPVCC))
+   if ( btnPinHandled )
    {
-      Serial.println(F("SSD1306 allocation failed"));
-      while(1); // Don't proceed, loop forever
+      detachInterrupt(BUTTON_PIN);
+      tBtnHandle.restartDelayed();
+      btnPinHandled = false;
    }
-
-   // Draw splash screen
-   display.drawBitmap(0, 0, wywh, SCREEN_WIDTH, SCREEN_HEIGHT, WHITE, BLACK);
-   display.display();
-   delay(100); //+++ change to 5000
-   
-   // Clear and set font size
-   display.clearDisplay();
-   display.setTextSize(1);
-   display.setTextColor(WHITE, BLACK);
-
-#ifndef DEBUG
-   // Initialize OBD communitcation
-   delay(500);
-   obd.begin();
-   display.println("\n  Connecting...");
-   display.display();
-
-   Serial.print("Connecting to OBD");
-   while (!obd.init())
-   {
-      Serial.print(".");
-   }
-#endif
-   display.clearDisplay();
-} // end setup()
+} // end buttonPressed()
 
 
-void loop( void )
+void btnHandleCB( void )
 {
-   static DataType data[4] = { {PID_AIR_FUEL_RATIO,  FLOAT_TYPE2, 0, 0, 0, 0, FreeSansBold12pt7b, 0, 0},
-                                    {PID_INTAKE_TEMP,     INT_TYPE   , 0, 0, 0, 0, FreeSansBold9pt7b , 0, 0},
-                                    {PID_ENGINE_OIL_TEMP, INT_TYPE   , 0, 0, 0, 0, FreeSansBold9pt7b , 0, 0},
-                                    {PID_BATTERY_VOLTAGE, FLOAT_TYPE1, 0, 0, 0, 1, FreeSansBold12pt7b, 0, 0},
-                                    /*{PID_COOLANT_TEMP,    INT_TYPE   , 0, 0, 0, 1, FreeSansBold9pt7b , 0, 0},
-                                    {PID_FUEL_PRESSURE,   INT_TYPE   , 0, 0, 0, 1, FreeSansBold9pt7b , 0, 0},
-                                    {PID_RPM,             UINT_TYPE  , 0, 0, 0, 2, FreeSansBold9pt7b , 0, 0}, 
-                                    {PID_SPEED,           UINT_TYPE  , 0, 0, 0, 2, FreeSansBold9pt7b , 0, 0},
-                                    {PID_ENGINE_LOAD,     INT_TYPE   , 0, 0, 0, 2, FreeSansBold9pt7b , 0, 0},
-                                    {PID_THROTTLE,        INT_TYPE   , 0, 0, 0, 2, FreeSansBold9pt7b , 0, 0},
-                                    {PID_MAF_FLOW,        FLOAT_TYPE1, 0, 0, 0, 2, FreeSansBold12pt7b, 0, 0} */};
-   static byte pid_inx = 0, screen_inx = 0;
-   drawBgScreen(screen_inx);
-//   char data[BUFFER_SIZE];
-
-   // While mode button is not pressed (my button is ~227)
-   while ( (analogRead(A0) <= BTN_LOW_VALUE) || (analogRead(A0) >= BTN_HIGH_VALUE) )
-   {
-      // Send a query to OBD adapter for specified OBD-II pid
-      /*if ( PID_ENGINE_OIL_TEMP == data[pid_inx].pid )
-      {
-         if ( obd.sendCommand("0121\r", data, BUFFER_SIZE) )
-         {
-            data[pid_inx].value = ((float)strtol(&data[BUFFER_SIZE-1], 0, 16));
-            showData(screen_inx, data[pid_inx]);
-         }
-      }
-      else */if ( 1/*obd.readPID(data[pid_inx].pid, data[pid_inx].value)*/ )
-      {
-         if ( PID_MAF_FLOW == data[pid_inx].pid )
-         {
-            data[pid_inx].Fvalue = (float(data[7/*speed*/].value)*7.718)/float(data[pid_inx].value);
-         }
-         showData(screen_inx, data[pid_inx]);
-      }
-
-      pid_inx = (pid_inx + 1) % N_PIDS;
-#ifndef DEBUG
-      // Error checking
-      if ( obd.errors >= 2 ) 
-      {
-         reconnect();
-         setup();
-      }
-#endif
-      delay(100);
-   }
-
-   // When mode button is pressed
-   while ( (analogRead(A0) >= BTN_LOW_VALUE) && (analogRead(A0) <= BTN_HIGH_VALUE) )
-   {
-      delay(100);
-   }
+   _PP(millis()); _PP(": btnHandleCB");
 
    // Increment mode
-   display.clearDisplay();
    screen_inx = (screen_inx + 1) % N_SCREENS;
-#ifdef DEBUG
-   Serial.print("Current screen: ");
-   Serial.println(screen_inx);
+   _PP(" | Screen: "); _PL(screen_inx + 1);
+
+   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonPressed, RISING);
+   btnPinHandled = true;
+} // end btnHandleCB()
+
+
+void readObdDataCB( void )
+{
+   _PP(millis()); _PL(": readObdDataCB");
+   
+   /*char data[BUFFER_SIZE];
+   // Send a query to OBD adapter for specified OBD-II pid
+   if ( PID_ENGINE_OIL_TEMP == data[pid_inx].pid )
+   {
+      if ( obd.sendCommand("0121\r", data, BUFFER_SIZE) )
+      {
+         data[pid_inx].value = ((float)strtol(&data[BUFFER_SIZE-1], 0, 16));
+         showData(screen_inx, data[pid_inx]);
+      }
+   }
+   else */if ( obd.readPID(data[pid_inx].pid, data[pid_inx].raw_data) )
+   {
+#ifdef _DEBUG_
+      data[pid_inx].raw_data = random(10, 299);
 #endif
-} // end loop()
+      if ( PID_MAF_FLOW == data[pid_inx].pid )
+      {
+         data[pid_inx].Fvalue = (float(data[7/*speed*/].raw_data)*7.718)/float(data[pid_inx].raw_data);
+      }
+   }
+
+   processData();
+   pid_inx = (pid_inx + 1) % N_PIDS;
+
+#ifndef _DEBUG_
+   // Error checking
+   if ( obd.errors >= 2 ) 
+   {
+      reconnect();
+      setup();
+   }
+#endif
+} // end readObdDataCB()
 
 
-static void reconnect( void )
+void drawScreenCB( void )
+{
+   _PP(millis()); _PL(": drawScreenCB");
+   // Clear and draw the background and data
+   display.clearDisplay();
+   drawBgScreen();
+   showData();
+   display.display();
+} // end drawScreenCB()
+
+
+/*************************
+ *    DISPLAY FUNCTIONS
+ ************************/
+
+
+void reconnect( void )
 {
    display.clearDisplay();
    display.setTextSize(1);
@@ -203,99 +202,142 @@ static void reconnect( void )
 } // end reconnect()
 
 
-static void showData( byte screen_inx, DataType crt_data )
+void processData( void )
 {
-   // Calculate the value of the raw data, x pos, and y pos
-   switch ( crt_data.pid ) 
+   // Calculate value from raw data
+   switch ( data[pid_inx].pid )
    {
       case PID_AIR_FUEL_RATIO:
-         crt_data.Fvalue = (float)crt_data.value*256/32768*14.7;
-         crt_data.posX = 33;
-         crt_data.posY = (FONT_12PT_H / 2) + 16;
+         data[pid_inx].Fvalue = (float)data[pid_inx].raw_data*256/32768*14.7;
          break;
       case PID_INTAKE_TEMP:
-         crt_data.value = crt_data.value*1.8+32;
-         crt_data.posX = (SCREEN_WIDTH / 2) - (FONT_9PT_W * numDigits(crt_data.value)) - 1;
-         crt_data.posY = (SCREEN_HEIGHT / 2) + (FONT_9PT_H / 2) + 16;
+         data[pid_inx].Ivalue = data[pid_inx].raw_data*1.8+32;
          break;
       case PID_ENGINE_OIL_TEMP:
-         crt_data.value = crt_data.value*1.8+32;
-         crt_data.posX = SCREEN_WIDTH - (FONT_9PT_W * numDigits(crt_data.value)) - 1;
-         crt_data.posY = (SCREEN_HEIGHT / 2) + (FONT_9PT_H / 2) + 16;
+         data[pid_inx].Ivalue = data[pid_inx].raw_data*1.8+32;
          break;
       case PID_BATTERY_VOLTAGE:
-         crt_data.Fvalue = (float)crt_data.value/10;
-         crt_data.posX = 33;
-         crt_data.posY = (FONT_12PT_H / 2) + 16;
+         data[pid_inx].Fvalue = (float)data[pid_inx].raw_data/10;
          break;
       case PID_COOLANT_TEMP:
-         crt_data.value = crt_data.value*1.8+32;
-         crt_data.posX = (SCREEN_WIDTH / 2) - (FONT_9PT_W * numDigits(crt_data.value)) - 1;
-         crt_data.posY = (SCREEN_HEIGHT / 2) + (FONT_9PT_H / 2) + 16;
+         data[pid_inx].Ivalue = data[pid_inx].raw_data*1.8+32;
          break;
       case PID_FUEL_PRESSURE:
-         // crt_data.value = 
-         crt_data.posX = SCREEN_WIDTH - (FONT_9PT_W * numDigits(crt_data.value)) - 1;
-         crt_data.posY = (SCREEN_HEIGHT / 2) + (FONT_9PT_H / 2) + 16;
+         data[pid_inx].Ivalue = data[pid_inx].raw_data;
          break;
       case PID_RPM:
-         crt_data.Uvalue = (unsigned int)crt_data.value % 10000;
-         crt_data.posX = (SCREEN_WIDTH / 2) - (FONT_9PT_W * numDigits(crt_data.Uvalue)) - 1;
-         crt_data.posY = SCREEN_HEIGHT - 1;
+         data[pid_inx].Uvalue = (unsigned int)data[pid_inx].raw_data % 10000;
          break;
       case PID_SPEED:
-         crt_data.Uvalue = (unsigned int)crt_data.value % 1000;
-         crt_data.posX = SCREEN_WIDTH - (FONT_9PT_W * numDigits(crt_data.Uvalue)) - 1;
-         crt_data.posY = (SCREEN_HEIGHT / 2) + FONT_9PT_H;
+         data[pid_inx].Uvalue = (unsigned int)data[pid_inx].raw_data % 1000;
          break;
       case PID_ENGINE_LOAD:
-         crt_data.posX = SCREEN_WIDTH - (FONT_9PT_W * numDigits(crt_data.value)) - 1;
-         crt_data.posY = SCREEN_HEIGHT - 1;
+         data[pid_inx].Ivalue = data[pid_inx].raw_data;
          break;
       case PID_THROTTLE:
-         crt_data.value = crt_data.value % 100;
-         crt_data.posX = (SCREEN_WIDTH / 2) - (FONT_9PT_W * numDigits(crt_data.value)) - 1;
-         crt_data.posY = (SCREEN_HEIGHT / 2) + FONT_9PT_H;
+         data[pid_inx].Ivalue = data[pid_inx].raw_data % 100;
          break;
       case PID_MAF_FLOW:
-         crt_data.posX = (SCREEN_WIDTH / 2) - (FONT_12PT_W * numDigits(crt_data.Fvalue)) - 1;
-         crt_data.posY = SCREEN_HEIGHT / 2 - 3;
          break;
       default:
          // average mpg
-         crt_data.posX = (FONT_12PT_W * numDigits(crt_data.Fvalue)) - 1;
-         crt_data.posY = SCREEN_HEIGHT / 2 - 3;
+         data[pid_inx].Fvalue = (float)data[pid_inx].raw_data;
          break;
    }
+} // end processData()
 
-   // Draw the data if screen indices match
-   if ( crt_data.screen == screen_inx )
+
+void showData( void )
+{
+   uint16_t posX = 0, posY = 0;
+
+   // Calculate the x pos and y pos (if the PID is currently on-screen)
+   for ( int i = 0; i < N_PIDS; i++ )
    {
-      display.clearDisplay();
-      display.setFont(&crt_data.font);
-      display.setCursor(crt_data.posX, crt_data.posY);
-      switch ( crt_data.type )
+      if ( data[i].screen == screen_inx )
       {
-         case FLOAT_TYPE1:
-            display.print(crt_data.Fvalue, 1);
-            break;
-         case FLOAT_TYPE2:
-            display.print(crt_data.Fvalue, 2);
-            break;
-         case INT_TYPE:
-            display.print(crt_data.value);
-            break;
-         case UINT_TYPE:
-            display.print(crt_data.Uvalue);
-            break;
+         switch ( data[i].pid )
+         {
+            case PID_AIR_FUEL_RATIO:
+               posX = 33;
+               posY = (FONT_12PT_H / 2) + 10;
+               break;
+            case PID_INTAKE_TEMP:
+               posX = (SCREEN_WIDTH / 2) - (FONT_9PT_W * numDigits(data[i].Ivalue)) - 1;
+               posY = (SCREEN_HEIGHT / 2) + (FONT_9PT_H / 2) + 16;
+               break;
+            case PID_ENGINE_OIL_TEMP:
+               posX = SCREEN_WIDTH - (FONT_9PT_W * numDigits(data[i].Ivalue)) - 1;
+               posY = (SCREEN_HEIGHT / 2) + (FONT_9PT_H / 2) + 16;
+               break;
+            case PID_BATTERY_VOLTAGE:
+               posX = 33;
+               posY = (FONT_12PT_H / 2) + 10;
+               break;
+            case PID_COOLANT_TEMP:
+               posX = (SCREEN_WIDTH / 2) - (FONT_9PT_W * numDigits(data[i].Ivalue)) - 1;
+               posY = (SCREEN_HEIGHT / 2) + (FONT_9PT_H / 2) + 16;
+               break;
+            case PID_FUEL_PRESSURE:
+               posX = SCREEN_WIDTH - (FONT_9PT_W * numDigits(data[i].Ivalue)) - 1;
+               posY = (SCREEN_HEIGHT / 2) + (FONT_9PT_H / 2) + 16;
+               break;
+            case PID_RPM:
+               posX = (SCREEN_WIDTH / 2) - (FONT_9PT_W * numDigits(data[i].Uvalue)) - 1;
+               posY = SCREEN_HEIGHT - 1 - (FONT_9PT_H / 2);
+               break;
+            case PID_SPEED:
+               posX = SCREEN_WIDTH - (FONT_9PT_W * numDigits(data[i].Uvalue)) - 1;
+               posY = (SCREEN_HEIGHT / 2) + FONT_9PT_H;
+               break;
+            case PID_ENGINE_LOAD:
+               posX = SCREEN_WIDTH - (FONT_9PT_W * numDigits(data[i].Ivalue)) - 1;
+               posY = SCREEN_HEIGHT - 1;
+               break;
+            case PID_THROTTLE:
+               posX = (SCREEN_WIDTH / 2) - (FONT_9PT_W * numDigits(data[i].Ivalue)) - 1;
+               posY = (SCREEN_HEIGHT / 2) + FONT_9PT_H;
+               break;
+            case PID_MAF_FLOW:
+               posX = (SCREEN_WIDTH / 2) - (FONT_12PT_W * numDigits(data[i].Fvalue)) - 1;
+               posY = SCREEN_HEIGHT / 2 - 3;
+               break;
+            default:
+               // AVERAGE MPG
+               posX = (FONT_12PT_W * numDigits(data[i].Fvalue)) - 1;
+               posY = SCREEN_HEIGHT / 2 - 3;
+               break;
+         }
+         drawDataByPos(posX, posY, i);
       }
-      display.display();
    }
 } // end showData()
 
 
-static void drawBgScreen( byte screen_inx )
+void drawDataByPos( uint16_t posX, uint16_t posY, byte inx )
 {
+   display.setCursor(posX, posY);
+   switch ( data[inx].type )
+   {
+      case FLOAT_TYPE:
+         display.setFont(&FreeSansBold12pt7b);
+         display.print(data[inx].Fvalue, 1);
+         break;
+      case INT_TYPE:
+         display.setFont(&FreeSansBold9pt7b);
+         display.print(data[inx].Ivalue);
+         break;
+      case UINT_TYPE:
+         display.setFont(&FreeSansBold9pt7b);
+         display.print(data[inx].Uvalue);
+         break;
+   }
+} // end drawDataByPos()
+
+
+void drawBgScreen( void )
+{
+   display.setFont();
    switch ( screen_inx ) 
    {
       case 0: // First screen
@@ -342,15 +384,86 @@ static void drawBgScreen( byte screen_inx )
          display.drawBitmap(SCREEN_WIDTH - 16, 1, oval_bits, 16, 7, WHITE, BLACK);
          break;
    }
-   display.display();
 } // end drawBgScreen()
+
+
+/*************************
+ *    ARDUINO FUNCTIONS
+ ************************/
+
+
+void setup( void )
+{
+#ifdef _DEBUG_
+   randomSeed(millis());
+   Serial.begin(115200);
+   _PL("\n\n\n=============\nOBD Gauge\n=============");
+#endif
+ 
+   // Initialize button 
+   // pinMode(BUTTON_PIN, INPUT_PULLUP);
+   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonPressed, RISING);
+
+   // Initialize screen
+   if( !display.begin(SSD1306_SWITCHCAPVCC) )
+   {
+      _PP(millis()); _PL(F(": SSD1306 allocation failed"));
+      while(1); // Don't proceed, loop forever
+   }
+
+   // Initialize scheduler
+   runner.init();
+   _PP(millis()); _PL(": Initialized scheduler");
+   runner.addTask(tReadDataOBD);
+   runner.addTask(tDrawScreen);
+   runner.addTask(tBtnHandle);
+
+   // Draw splash screen
+   display.drawBitmap(0, 0, wywh, SCREEN_WIDTH, SCREEN_HEIGHT, WHITE, BLACK);
+   display.display();
+   delay(5000);
+
+   // Enable the scheduler tasks
+   tReadDataOBD.enable();
+   _PP(millis()); _PL(": tReadDataOBD enabled");
+   tDrawScreen.enable();
+   _PP(millis()); _PL(": tDrawScreen enabled");
+   
+   // Clear and set font size
+   display.clearDisplay();
+   display.setTextSize(1);
+   display.setTextColor(WHITE, BLACK);
+
+#ifndef _DEBUG_
+   // Initialize OBD communitcation
+   delay(500);
+   obd.begin();
+   display.println("\n  Connecting...");
+   display.display();
+
+   _PP(millis()); _PP(": Connecting to OBD");
+   while (!obd.init())
+   {
+      _PP(".");
+   }
+   _PP("\n");
+#endif
+   display.clearDisplay();
+} // end setup()
+
+
+void loop( void )
+{
+   runner.execute();
+} // end loop()
 
 
 /*************************
  *    UTILITIES
  ************************/
 
-static int numDigits( int num )
+
+int numDigits( int num )
 {
    int num_digits = 0;
    while ( num != 0 )
@@ -362,7 +475,7 @@ static int numDigits( int num )
 } // end numDigits()
 
 
-static int numDigits( unsigned int num )
+int numDigits( unsigned int num )
 {
    int num_digits = 0;
    while ( num != 0 )
@@ -374,7 +487,7 @@ static int numDigits( unsigned int num )
 } // end numDigits()
 
 
-static int numDigits( float num )
+int numDigits( float num )
 {
    num *= 10;
    int num_digits = 0;
